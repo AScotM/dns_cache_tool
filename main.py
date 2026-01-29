@@ -17,6 +17,7 @@ from enum import IntEnum
 import hashlib
 from collections import defaultdict, OrderedDict
 import pathlib
+import secrets
 
 
 class DNSRecordType(IntEnum):
@@ -152,197 +153,230 @@ class AtomicJSONFile:
     
     def save(self, data):
         with self.lock:
-            temp = self.filename.with_suffix('.tmp')
-            with open(temp, 'w') as f:
+            with tempfile.NamedTemporaryFile(
+                mode='w',
+                dir=str(self.filename.parent),
+                prefix=self.filename.stem + '_',
+                suffix='.tmp',
+                delete=False
+            ) as f:
+                os.chmod(f.name, 0o600)
                 json.dump(data, f, indent=2)
-            temp.rename(self.filename)
+                temp_name = f.name
+            
+            try:
+                os.replace(temp_name, str(self.filename))
+            except:
+                if os.path.exists(temp_name):
+                    os.unlink(temp_name)
+                raise
 
 
 class TTLCache:
     def __init__(self, filename=None, max_size=1000, default_ttl=300, cleanup_interval=60):
-        self.filename = filename or "/tmp/dns_ttl_cache.json"
+        if filename:
+            filename = os.path.abspath(filename)
+            allowed_dirs = [tempfile.gettempdir(), os.path.expanduser("~/.cache")]
+            if not any(filename.startswith(d) for d in allowed_dirs):
+                raise ValueError(f"Cache file must be in allowed directory: {allowed_dirs}")
+        else:
+            filename = "/tmp/dns_ttl_cache.json"
+        
+        self.filename = pathlib.Path(filename)
+        self.filename.parent.mkdir(mode=0o700, exist_ok=True, parents=True)
         self.max_size = max_size
         self.default_ttl = default_ttl
         self.cleanup_interval = cleanup_interval
         self.storage = AtomicJSONFile(self.filename)
+        self.lock = threading.RLock()
         self.data = {}
         self.stats = {'hits': 0, 'misses': 0, 'evictions': 0, 'last_cleanup': 0}
         self._load()
     
     def _key(self, domain, qtype, server="default"):
         domain_norm = domain.lower().rstrip('.')
-        return hashlib.sha256(f"{domain_norm}:{qtype.value}:{server}".encode()).hexdigest()[:16]
+        return f"{domain_norm}:{qtype.value}:{server}"
     
     def _load(self):
-        try:
-            loaded = self.storage.load()
-            if isinstance(loaded, dict):
-                self.data = {k: v for k, v in loaded.items() if not self._is_expired(v)}
-            else:
+        with self.lock:
+            try:
+                loaded = self.storage.load()
+                if isinstance(loaded, dict):
+                    self.data = {k: v for k, v in loaded.items() if not self._is_expired(v)}
+                else:
+                    self.data = {}
+                self._periodic_cleanup(force=True)
+            except (json.JSONDecodeError, OSError):
                 self.data = {}
-            self._periodic_cleanup(force=True)
-        except (json.JSONDecodeError, OSError):
-            self.data = {}
     
     def _save(self):
-        self._periodic_cleanup()
-        self.storage.save(self.data)
+        with self.lock:
+            self._periodic_cleanup()
+            self.storage.save(self.data)
     
     def _is_expired(self, entry):
         expires_at = entry.get('expires_at', 0)
         return time.time() > expires_at
     
     def _periodic_cleanup(self, force=False):
-        now = time.time()
-        if not force and now - self.stats['last_cleanup'] < self.cleanup_interval:
-            return
-        
-        initial_count = len(self.data)
-        expired_keys = [k for k, v in self.data.items() if self._is_expired(v)]
-        
-        for key in expired_keys:
-            del self.data[key]
-        
-        expired_count = len(expired_keys)
-        if expired_count > 0:
-            self.stats['evictions'] += expired_count
-        
-        if len(self.data) > self.max_size:
-            sorted_items = sorted(self.data.items(), key=lambda x: x[1].get('expires_at', 0))
-            self.data = dict(sorted_items[-self.max_size:])
-            self.stats['evictions'] += initial_count - len(self.data)
-        
-        self.stats['last_cleanup'] = now
+        with self.lock:
+            now = time.time()
+            if not force and now - self.stats['last_cleanup'] < self.cleanup_interval:
+                return
+            
+            initial_count = len(self.data)
+            expired_keys = [k for k, v in self.data.items() if self._is_expired(v)]
+            
+            for key in expired_keys:
+                del self.data[key]
+            
+            expired_count = len(expired_keys)
+            if expired_count > 0:
+                self.stats['evictions'] += expired_count
+            
+            if len(self.data) > self.max_size:
+                sorted_items = sorted(self.data.items(), key=lambda x: x[1].get('expires_at', 0))
+                self.data = dict(sorted_items[-self.max_size:])
+                self.stats['evictions'] += initial_count - len(self.data)
+            
+            self.stats['last_cleanup'] = now
     
     def get(self, domain, qtype, server="default"):
-        self._periodic_cleanup()
-        key = self._key(domain, qtype, server)
-        
-        if key not in self.data:
-            self.stats['misses'] += 1
-            return None
-        
-        entry = self.data[key]
-        
-        if self._is_expired(entry):
-            del self.data[key]
-            self.stats['misses'] += 1
-            self._save()
-            return None
-        
-        self.stats['hits'] += 1
-        
-        cached_records = []
-        for rec_data in entry.get('records', []):
-            rec_data['creation_time'] = entry.get('query_time', time.time())
-            try:
-                cached_records.append(DNSRecord.from_cache_dict(rec_data))
-            except (KeyError, ValueError):
-                continue
-        
-        return cached_records
+        with self.lock:
+            self._periodic_cleanup()
+            key = self._key(domain, qtype, server)
+            
+            if key not in self.data:
+                self.stats['misses'] += 1
+                return None
+            
+            entry = self.data[key]
+            
+            if self._is_expired(entry):
+                del self.data[key]
+                self.stats['misses'] += 1
+                self._save()
+                return None
+            
+            self.stats['hits'] += 1
+            
+            cached_records = []
+            for rec_data in entry.get('records', []):
+                rec_data['creation_time'] = entry.get('query_time', time.time())
+                try:
+                    cached_records.append(DNSRecord.from_cache_dict(rec_data))
+                except (KeyError, ValueError):
+                    continue
+            
+            return cached_records
     
     def set(self, domain, qtype, records, server="default", negative=False, query_time=None):
-        if query_time is None:
-            query_time = time.time()
-        
-        key = self._key(domain, qtype, server)
-        
-        if negative:
-            ttl = min(300, records[0].ttl if records else self.default_ttl)
-            cache_records = []
-        elif records:
-            valid_records = [r for r in records if not r.is_expired]
-            if not valid_records:
-                return
-            ttl = min(r.ttl for r in valid_records)
-            cache_records = [r.to_cache_dict() for r in valid_records]
-        else:
-            ttl = self.default_ttl
-            cache_records = []
-        
-        entry = {
-            'domain': domain,
-            'type': qtype.name,
-            'records': cache_records,
-            'ttl': ttl,
-            'expires_at': query_time + ttl,
-            'query_time': query_time,
-            'server': server,
-            'negative': negative,
-            'created': time.time()
-        }
-        
-        self.data[key] = entry
-        self._save()
-    
-    def set_negative(self, domain, qtype, ttl=None, server="default", query_time=None):
-        if query_time is None:
-            query_time = time.time()
-        
-        key = self._key(domain, qtype, server)
-        ttl = ttl or self.default_ttl
-        
-        entry = {
-            'domain': domain,
-            'type': qtype.name,
-            'records': [],
-            'ttl': ttl,
-            'expires_at': query_time + ttl,
-            'query_time': query_time,
-            'server': server,
-            'negative': True,
-            'created': time.time()
-        }
-        
-        self.data[key] = entry
-        self._save()
-    
-    def delete(self, domain, qtype, server="default"):
-        key = self._key(domain, qtype, server)
-        if key in self.data:
-            del self.data[key]
+        with self.lock:
+            if query_time is None:
+                query_time = time.time()
+            
+            key = self._key(domain, qtype, server)
+            
+            if negative:
+                ttl = min(300, records[0].ttl if records else self.default_ttl)
+                cache_records = []
+            elif records:
+                valid_records = [r for r in records if not r.is_expired]
+                if not valid_records:
+                    return
+                ttl = min(r.ttl for r in valid_records)
+                cache_records = [r.to_cache_dict() for r in valid_records]
+            else:
+                ttl = self.default_ttl
+                cache_records = []
+            
+            entry = {
+                'domain': domain,
+                'type': qtype.name,
+                'records': cache_records,
+                'ttl': ttl,
+                'expires_at': query_time + ttl,
+                'query_time': query_time,
+                'server': server,
+                'negative': negative,
+                'created': time.time()
+            }
+            
+            self.data[key] = entry
             self._save()
     
+    def set_negative(self, domain, qtype, ttl=None, server="default", query_time=None):
+        with self.lock:
+            if query_time is None:
+                query_time = time.time()
+            
+            key = self._key(domain, qtype, server)
+            ttl = ttl or self.default_ttl
+            
+            entry = {
+                'domain': domain,
+                'type': qtype.name,
+                'records': [],
+                'ttl': ttl,
+                'expires_at': query_time + ttl,
+                'query_time': query_time,
+                'server': server,
+                'negative': True,
+                'created': time.time()
+            }
+            
+            self.data[key] = entry
+            self._save()
+    
+    def delete(self, domain, qtype, server="default"):
+        with self.lock:
+            key = self._key(domain, qtype, server)
+            if key in self.data:
+                del self.data[key]
+                self._save()
+    
     def clear(self):
-        self.data = {}
-        self.stats = {'hits': 0, 'misses': 0, 'evictions': 0, 'last_cleanup': 0}
-        try:
-            self.filename.unlink(missing_ok=True)
-        except:
-            pass
+        with self.lock:
+            self.data = {}
+            self.stats = {'hits': 0, 'misses': 0, 'evictions': 0, 'last_cleanup': 0}
+            try:
+                self.filename.unlink(missing_ok=True)
+            except:
+                pass
     
     def get_stats(self):
-        self._periodic_cleanup(force=True)
-        total = self.stats['hits'] + self.stats['misses']
-        hit_rate = self.stats['hits'] / total if total > 0 else 0
-        
-        positive = sum(1 for v in self.data.values() if not v.get('negative', False))
-        negative = sum(1 for v in self.data.values() if v.get('negative', False))
-        
-        now = time.time()
-        avg_age = sum(now - v.get('created', now) for v in self.data.values()) / len(self.data) if self.data else 0
-        
-        return {
-            'total_entries': len(self.data),
-            'positive_entries': positive,
-            'negative_entries': negative,
-            'cache_hits': self.stats['hits'],
-            'cache_misses': self.stats['misses'],
-            'evictions': self.stats['evictions'],
-            'hit_rate': round(hit_rate, 3),
-            'avg_entry_age': round(avg_age, 1)
-        }
+        with self.lock:
+            self._periodic_cleanup(force=True)
+            total = self.stats['hits'] + self.stats['misses']
+            hit_rate = self.stats['hits'] / total if total > 0 else 0
+            
+            positive = sum(1 for v in self.data.values() if not v.get('negative', False))
+            negative = sum(1 for v in self.data.values() if v.get('negative', False))
+            
+            now = time.time()
+            avg_age = sum(now - v.get('created', now) for v in self.data.values()) / len(self.data) if self.data else 0
+            
+            return {
+                'total_entries': len(self.data),
+                'positive_entries': positive,
+                'negative_entries': negative,
+                'cache_hits': self.stats['hits'],
+                'cache_misses': self.stats['misses'],
+                'evictions': self.stats['evictions'],
+                'hit_rate': round(hit_rate, 3),
+                'avg_entry_age': round(avg_age, 1)
+            }
     
     def get_entries(self):
-        self._periodic_cleanup()
-        entries = []
-        for key, value in self.data.items():
-            entry = value.copy()
-            entry['key'] = key
-            entry['remaining_ttl'] = max(0, entry['expires_at'] - time.time())
-            entries.append(entry)
-        return entries
+        with self.lock:
+            self._periodic_cleanup()
+            entries = []
+            for key, value in self.data.items():
+                entry = value.copy()
+                entry['key'] = key
+                entry['remaining_ttl'] = max(0, entry['expires_at'] - time.time())
+                entries.append(entry)
+            return entries
 
 
 class DNSResolver:
@@ -363,8 +397,19 @@ class DNSResolver:
         self.max_query_stats = 1000
         self.cname_chain = set()
     
+    def get_address_family(self, ip):
+        try:
+            socket.inet_pton(socket.AF_INET6, ip)
+            return socket.AF_INET6
+        except socket.error:
+            try:
+                socket.inet_pton(socket.AF_INET, ip)
+                return socket.AF_INET
+            except socket.error:
+                raise ValueError(f"Invalid IP address: {ip}")
+    
     def build_query(self, domain, qtype, edns=False):
-        tid = random.randint(0, 65535)
+        tid = secrets.randbelow(65536)
         flags = 0x0100
         
         if edns:
@@ -478,17 +523,19 @@ class DNSResolver:
             elif rtype in (DNSRecordType.CNAME, DNSRecordType.NS, DNSRecordType.PTR):
                 return self.parse_name(packet, offset)[0]
             elif rtype == DNSRecordType.TXT:
-                if len(rdata) == 0:
-                    return ""
-                try:
-                    if rdata[0] < len(rdata):
-                        return rdata[1:1+rdata[0]].decode('utf-8', 'replace')
-                except:
-                    pass
-                try:
-                    return rdata.decode('utf-8', 'replace')
-                except:
-                    return rdata.hex()
+                txt_strings = []
+                idx = 0
+                while idx < len(rdata):
+                    length = rdata[idx]
+                    idx += 1
+                    if idx + length > len(rdata):
+                        break
+                    try:
+                        txt_strings.append(rdata[idx:idx+length].decode('utf-8', 'replace'))
+                    except:
+                        txt_strings.append(rdata[idx:idx+length].hex())
+                    idx += length
+                return ' '.join(txt_strings) if txt_strings else ''
             elif rtype == DNSRecordType.SOA:
                 mname, offset1 = self.parse_name(packet, offset)
                 rname, offset2 = self.parse_name(packet, offset1)
@@ -538,12 +585,28 @@ class DNSResolver:
                 raise NameError(f"Domain '{domain}' not found (NXDOMAIN)")
             raise ValueError(f"DNS server error: {error_msg}")
         
-        records = []
         offset = 12
+        questions = []
         
         for _ in range(qdcount):
-            _, offset = self.parse_name(data, offset)
-            offset += 4
+            try:
+                qname, offset = self.parse_name(data, offset)
+                if offset + 4 > len(data):
+                    raise ValueError("Question section truncated")
+                qtype_val, qclass = struct.unpack(">HH", data[offset:offset+4])
+                offset += 4
+                questions.append((qname.lower(), qtype_val))
+            except (ValueError, IndexError) as e:
+                raise ValueError(f"Invalid question section: {e}")
+        
+        domain_normalized = domain.rstrip('.').lower()
+        for qname, qtype_val in questions:
+            if qname != domain_normalized:
+                raise ValueError(f"Question name mismatch: expected {domain_normalized}, got {qname}")
+            if qtype_val != qtype.value:
+                raise ValueError(f"Question type mismatch: expected {qtype.value}, got {qtype_val}")
+        
+        records = []
         
         sections = [
             (ancount, "answer"),
@@ -571,13 +634,7 @@ class DNSResolver:
         ip, port = server
         
         sock = None
-        family = socket.AF_INET
-        try:
-            addr_obj = ipaddress.ip_address(ip)
-            if isinstance(addr_obj, ipaddress.IPv6Address):
-                family = socket.AF_INET6
-        except ValueError:
-            pass
+        family = self.get_address_family(ip)
         
         try:
             if use_tcp:
@@ -611,7 +668,14 @@ class DNSResolver:
                 sock.sendto(query, (ip, port))
                 
                 try:
-                    data, _ = sock.recvfrom(4096)
+                    data, addr = sock.recvfrom(65535)
+                    
+                    if addr[0] != ip:
+                        raise ValueError(f"Response from unexpected source: {addr[0]}")
+                    
+                    if len(data) >= 12 and (data[2] & 0x02):
+                        return self.query_server(domain, qtype, server, query_time, use_tcp=True)
+                    
                     response = data
                 except socket.timeout:
                     if not use_tcp:
@@ -639,7 +703,10 @@ class DNSResolver:
             if sock:
                 sock.close()
     
-    def resolve(self, domain, qtype="A", server=None, follow_cnames=True, depth=0):
+    def resolve(self, domain, qtype="A", server=None, follow_cnames=True, visited=None):
+        if visited is None:
+            visited = set()
+        
         if isinstance(qtype, str):
             try:
                 qtype = DNSRecordType[qtype.upper()]
@@ -649,15 +716,15 @@ class DNSResolver:
         domain = domain.rstrip('.').lower()
         query_time = time.time()
         
-        if depth > 10:
-            raise RecursionError(f"CNAME chain too deep for {domain}")
+        if domain in visited:
+            raise RecursionError(f"CNAME loop detected: {' -> '.join(visited)} -> {domain}")
         
-        cache_key = f"{domain}:{depth}"
-        if cache_key in self.cname_chain:
-            raise RecursionError(f"CNAME loop detected for {domain}")
-        self.cname_chain.add(cache_key)
+        visited.add(domain)
         
         try:
+            if len(visited) > 10:
+                raise RecursionError(f"CNAME chain too deep for {domain}")
+            
             if self.use_cache and self.cache:
                 cached = self.cache.get(domain, qtype, str(server or "default"))
                 if cached:
@@ -689,9 +756,9 @@ class DNSResolver:
                         
                         if target_records:
                             return target_records
-                        elif follow_cnames and cname_records and depth < 10:
+                        elif follow_cnames and cname_records:
                             cname_target = cname_records[0].data
-                            return self.resolve(cname_target, qtype, server, follow_cnames, depth + 1)
+                            return self.resolve(cname_target, qtype, server, follow_cnames, visited)
                         
                         return []
                         
@@ -706,27 +773,31 @@ class DNSResolver:
             
             raise Exception(f"All attempts failed. Last error: {last_error}")
         finally:
-            self.cname_chain.discard(cache_key)
+            visited.discard(domain)
     
     def reverse_lookup(self, ip):
+        if not ip or not isinstance(ip, str):
+            raise ValueError("IP address must be a non-empty string")
+        
+        ip = ip.strip()
         try:
             addr_obj = ipaddress.ip_address(ip)
-            if addr_obj.version == 4:
-                octets = str(addr_obj).split('.')
-                arpa = '.'.join(reversed(octets)) + '.in-addr.arpa'
-            else:
-                hex_str = addr_obj.exploded.replace(':', '')
-                arpa = '.'.join(reversed(hex_str)) + '.ip6.arpa'
-            
-            return self.resolve(arpa, "PTR")
-        except ValueError:
-            raise ValueError(f"Invalid IP address: {ip}")
+        except ValueError as e:
+            raise ValueError(f"Invalid IP address '{ip}': {e}")
+        
+        if addr_obj.version == 4:
+            octets = str(addr_obj).split('.')
+            arpa = '.'.join(reversed(octets)) + '.in-addr.arpa'
+        else:
+            hex_str = addr_obj.exploded.replace(':', '')
+            arpa = '.'.join(reversed(hex_str)) + '.ip6.arpa'
+        
+        return self.resolve(arpa, "PTR")
     
     def get_stats(self):
         stats = {
             'query_stats': dict(self.query_stats),
-            'server_count': len(self.servers),
-            'cname_chain_size': len(self.cname_chain)
+            'server_count': len(self.servers)
         }
         if self.use_cache and self.cache:
             stats['cache_stats'] = self.cache.get_stats()
@@ -798,7 +869,6 @@ def main():
         else:
             print("Resolver Statistics:")
             print(f"  Servers configured: {stats['server_count']}")
-            print(f"  Active CNAME chains: {stats['cname_chain_size']}")
             for key, value in sorted(stats['query_stats'].items()):
                 print(f"  {key}: {value}")
             if 'cache_stats' in stats:
