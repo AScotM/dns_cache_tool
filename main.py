@@ -16,9 +16,14 @@ from typing import List, Dict, Optional, Tuple, Any, Union, Set
 from enum import IntEnum
 import hashlib
 from collections import defaultdict, OrderedDict
+from collections import deque
 import pathlib
 import secrets
+import logging
+import array
+import re
 
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
 class DNSRecordType(IntEnum):
     A = 1
@@ -38,6 +43,26 @@ class DNSRecordType(IntEnum):
     TLSA = 52
     ANY = 255
 
+class RateLimiter:
+    def __init__(self, max_queries=10, window=1):
+        self.max_queries = max_queries
+        self.window = window
+        self.queries = defaultdict(lambda: deque(maxlen=max_queries))
+        self.lock = threading.RLock()
+    
+    def is_allowed(self, key):
+        with self.lock:
+            now = time.time()
+            queue = self.queries[key]
+            
+            while queue and queue[0] < now - self.window:
+                queue.popleft()
+            
+            if len(queue) >= self.max_queries:
+                return False
+            
+            queue.append(now)
+            return True
 
 @dataclass
 class DNSRecord:
@@ -52,6 +77,15 @@ class DNSRecord:
     def __post_init__(self):
         if self.creation_time is None:
             self.creation_time = time.time()
+    
+    def validate(self):
+        if len(self.name) > 253:
+            raise ValueError(f"Domain name too long: {len(self.name)} characters")
+        for label in self.name.rstrip('.').split('.'):
+            if len(label) > 63:
+                raise ValueError(f"Label too long: {len(label)} characters")
+        if self.ttl < 0:
+            raise ValueError(f"TTL cannot be negative: {self.ttl}")
     
     @property
     def remaining_ttl(self):
@@ -138,39 +172,49 @@ class DNSRecord:
             return f"{type_str}\t{srv.get('priority', 0)} {srv.get('weight', 0)} {srv.get('port', 0)} {srv.get('target', '')}"
         return f"{type_str}\t{self.data}"
 
-
 class AtomicJSONFile:
     def __init__(self, filename):
         self.filename = pathlib.Path(filename)
         self.lock = threading.RLock()
+        self.logger = logging.getLogger(f"{__name__}.AtomicJSONFile")
     
     def load(self):
         with self.lock:
             if not self.filename.exists():
                 return {}
-            with open(self.filename, 'r') as f:
-                return json.load(f)
+            
+            st = os.stat(self.filename)
+            if st.st_mode & 0o777 not in (0o600, 0o700, 0o644):
+                self.logger.warning(f"Insecure file permissions on {self.filename}: {oct(st.st_mode)}")
+            
+            try:
+                with open(self.filename, 'r') as f:
+                    return json.load(f)
+            except json.JSONDecodeError as e:
+                self.logger.error(f"JSON decode error in {self.filename}: {e}")
+                return {}
     
     def save(self, data):
         with self.lock:
-            with tempfile.NamedTemporaryFile(
-                mode='w',
-                dir=str(self.filename.parent),
-                prefix=self.filename.stem + '_',
-                suffix='.tmp',
-                delete=False
-            ) as f:
-                os.chmod(f.name, 0o600)
-                json.dump(data, f, indent=2)
-                temp_name = f.name
-            
+            temp_name = None
             try:
+                with tempfile.NamedTemporaryFile(
+                    mode='w',
+                    dir=str(self.filename.parent),
+                    prefix=self.filename.stem + '_',
+                    suffix='.tmp',
+                    delete=False
+                ) as f:
+                    os.chmod(f.name, 0o600)
+                    json.dump(data, f, indent=2)
+                    temp_name = f.name
+                
                 os.replace(temp_name, str(self.filename))
-            except:
-                if os.path.exists(temp_name):
+            except Exception as e:
+                self.logger.error(f"Failed to save cache: {e}")
+                if temp_name and os.path.exists(temp_name):
                     os.unlink(temp_name)
                 raise
-
 
 class TTLCache:
     def __init__(self, filename=None, max_size=1000, default_ttl=300, cleanup_interval=60):
@@ -189,57 +233,61 @@ class TTLCache:
         self.cleanup_interval = cleanup_interval
         self.storage = AtomicJSONFile(self.filename)
         self.lock = threading.RLock()
+        self.logger = logging.getLogger(f"{__name__}.TTLCache")
         self.data = {}
         self.stats = {'hits': 0, 'misses': 0, 'evictions': 0, 'last_cleanup': 0}
-        self._load()
+        
+        with self.lock:
+            self._load()
     
     def _key(self, domain, qtype, server="default"):
         domain_norm = domain.lower().rstrip('.')
         return f"{domain_norm}:{qtype.value}:{server}"
     
     def _load(self):
-        with self.lock:
-            try:
-                loaded = self.storage.load()
-                if isinstance(loaded, dict):
-                    self.data = {k: v for k, v in loaded.items() if not self._is_expired(v)}
-                else:
-                    self.data = {}
-                self._periodic_cleanup(force=True)
-            except (json.JSONDecodeError, OSError):
+        try:
+            loaded = self.storage.load()
+            if isinstance(loaded, dict):
+                self.data = {k: v for k, v in loaded.items() if not self._is_expired(v)}
+            else:
                 self.data = {}
+            self._periodic_cleanup(force=True)
+        except (json.JSONDecodeError, OSError) as e:
+            self.logger.warning(f"Failed to load cache: {e}")
+            self.data = {}
     
     def _save(self):
-        with self.lock:
+        try:
             self._periodic_cleanup()
             self.storage.save(self.data)
+        except Exception as e:
+            self.logger.error(f"Failed to save cache: {e}")
     
     def _is_expired(self, entry):
         expires_at = entry.get('expires_at', 0)
         return time.time() > expires_at
     
     def _periodic_cleanup(self, force=False):
-        with self.lock:
-            now = time.time()
-            if not force and now - self.stats['last_cleanup'] < self.cleanup_interval:
-                return
-            
-            initial_count = len(self.data)
-            expired_keys = [k for k, v in self.data.items() if self._is_expired(v)]
-            
-            for key in expired_keys:
-                del self.data[key]
-            
-            expired_count = len(expired_keys)
-            if expired_count > 0:
-                self.stats['evictions'] += expired_count
-            
-            if len(self.data) > self.max_size:
-                sorted_items = sorted(self.data.items(), key=lambda x: x[1].get('expires_at', 0))
-                self.data = dict(sorted_items[-self.max_size:])
-                self.stats['evictions'] += initial_count - len(self.data)
-            
-            self.stats['last_cleanup'] = now
+        now = time.time()
+        if not force and now - self.stats['last_cleanup'] < self.cleanup_interval:
+            return
+        
+        initial_count = len(self.data)
+        expired_keys = [k for k, v in self.data.items() if self._is_expired(v)]
+        
+        for key in expired_keys:
+            del self.data[key]
+        
+        expired_count = len(expired_keys)
+        if expired_count > 0:
+            self.stats['evictions'] += expired_count
+        
+        if len(self.data) > self.max_size:
+            sorted_items = sorted(self.data.items(), key=lambda x: x[1].get('expires_at', 0))
+            self.data = dict(sorted_items[-self.max_size:])
+            self.stats['evictions'] += initial_count - len(self.data)
+        
+        self.stats['last_cleanup'] = now
     
     def get(self, domain, qtype, server="default"):
         with self.lock:
@@ -264,8 +312,11 @@ class TTLCache:
             for rec_data in entry.get('records', []):
                 rec_data['creation_time'] = entry.get('query_time', time.time())
                 try:
-                    cached_records.append(DNSRecord.from_cache_dict(rec_data))
-                except (KeyError, ValueError):
+                    record = DNSRecord.from_cache_dict(rec_data)
+                    record.validate()
+                    cached_records.append(record)
+                except (KeyError, ValueError) as e:
+                    self.logger.debug(f"Failed to parse cached record: {e}")
                     continue
             
             return cached_records
@@ -303,6 +354,14 @@ class TTLCache:
             }
             
             self.data[key] = entry
+            
+            if len(self.data) > self.max_size:
+                sorted_items = sorted(self.data.items(), 
+                                    key=lambda x: x[1].get('expires_at', 0))
+                evicted_count = len(sorted_items) - self.max_size
+                self.data = dict(sorted_items[-self.max_size:])
+                self.stats['evictions'] += evicted_count
+            
             self._save()
     
     def set_negative(self, domain, qtype, ttl=None, server="default", query_time=None):
@@ -326,6 +385,12 @@ class TTLCache:
             }
             
             self.data[key] = entry
+            
+            if len(self.data) > self.max_size:
+                sorted_items = sorted(self.data.items(), 
+                                    key=lambda x: x[1].get('expires_at', 0))
+                self.data = dict(sorted_items[-self.max_size:])
+            
             self._save()
     
     def delete(self, domain, qtype, server="default"):
@@ -341,8 +406,8 @@ class TTLCache:
             self.stats = {'hits': 0, 'misses': 0, 'evictions': 0, 'last_cleanup': 0}
             try:
                 self.filename.unlink(missing_ok=True)
-            except:
-                pass
+            except Exception as e:
+                self.logger.error(f"Failed to clear cache file: {e}")
     
     def get_stats(self):
         with self.lock:
@@ -378,7 +443,6 @@ class TTLCache:
                 entries.append(entry)
             return entries
 
-
 class DNSResolver:
     DEFAULT_SERVERS = [
         ("8.8.8.8", 53),
@@ -387,15 +451,31 @@ class DNSResolver:
         ("8.8.4.4", 53)
     ]
     
-    def __init__(self, servers=None, timeout=3, retries=2, use_cache=True, cache_file=None):
+    DOMAIN_REGEX = re.compile(r'^(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$')
+    
+    def __init__(self, servers=None, timeout=3, retries=2, use_cache=True, cache_file=None, dnssec=False):
         self.servers = servers or self.DEFAULT_SERVERS
         self.timeout = timeout
         self.retries = retries
         self.use_cache = use_cache
         self.cache = TTLCache(cache_file) if use_cache else None
-        self.query_stats = OrderedDict()
+        self.dnssec = dnssec
+        self.logger = logging.getLogger(f"{__name__}.DNSResolver")
+        self.rate_limiter = RateLimiter()
+        self.query_stats = {}
         self.max_query_stats = 1000
-        self.cname_chain = set()
+        self.stats_lock = threading.RLock()
+    
+    def validate_domain(self, domain):
+        if len(domain) > 253:
+            raise ValueError(f"Domain name too long: {len(domain)} characters")
+        
+        for label in domain.rstrip('.').split('.'):
+            if len(label) > 63:
+                raise ValueError(f"Label '{label}' exceeds 63 characters")
+            if not label or not self.DOMAIN_REGEX.match(label + '.com'):
+                if not all(c.isalnum() or c == '-' for c in label):
+                    raise ValueError(f"Invalid characters in label '{label}'")
     
     def get_address_family(self, ip):
         try:
@@ -409,25 +489,29 @@ class DNSResolver:
                 raise ValueError(f"Invalid IP address: {ip}")
     
     def build_query(self, domain, qtype, edns=False):
+        self.validate_domain(domain)
+        
         tid = secrets.randbelow(65536)
         flags = 0x0100
         
-        if edns:
+        if edns or self.dnssec:
             arcount = 1
-            additional = b"\x00" + struct.pack(">HHIH", 41, 4096, 0, 0)
+            additional = b"\x00" + struct.pack(">HHIH", 41, 4096, 0x8000 if self.dnssec else 0, 0)
         else:
             arcount = 0
             additional = b""
         
         header = struct.pack(">HHHHHH", tid, flags, 1, 0, 0, arcount)
         
-        qname = b""
+        qname_parts = []
         for label in domain.rstrip('.').split('.'):
             label_bytes = label.encode('ascii', 'ignore')
-            qname += struct.pack("B", len(label_bytes)) + label_bytes
-        qname += b"\x00"
+            qname_parts.append(struct.pack("B", len(label_bytes)))
+            qname_parts.append(label_bytes)
+        qname_parts.append(b"\x00")
+        qname = b''.join(qname_parts)
         
-        question = qname + struct.pack(">HH", qtype, 1)
+        question = qname + struct.pack(">HH", qtype.value, 1)
         
         return header + question + additional, tid
     
@@ -449,13 +533,18 @@ class DNSResolver:
             
             if length & 0xC0 == 0xC0:
                 if offset >= len(data):
-                    break
+                    raise ValueError("Truncated compression pointer")
+                
+                if offset + 1 > len(data):
+                    raise ValueError("Incomplete compression pointer")
+                
                 pointer_bytes = data[offset-1:offset+1]
                 if len(pointer_bytes) != 2:
-                    break
+                    raise ValueError("Invalid compression pointer")
+                    
                 pointer = struct.unpack(">H", pointer_bytes)[0] & 0x3FFF
                 if pointer >= len(data):
-                    break
+                    raise ValueError("Compression pointer out of bounds")
                 
                 if not jumped:
                     original_offset = offset + 1
@@ -465,7 +554,7 @@ class DNSResolver:
                 continue
             
             if offset + length > len(data):
-                break
+                raise ValueError("Truncated label")
             
             label_bytes = data[offset:offset+length]
             try:
@@ -485,6 +574,9 @@ class DNSResolver:
         return ".".join(labels), original_offset if jumped else offset
     
     def parse_record(self, data, offset, section):
+        if offset >= len(data):
+            raise ValueError("Offset beyond data end")
+        
         name, offset = self.parse_name(data, offset)
         
         if offset + 10 > len(data):
@@ -493,13 +585,17 @@ class DNSResolver:
         rtype, rclass, ttl, rdlength = struct.unpack(">HHIH", data[offset:offset+10])
         offset += 10
         
+        if rclass != 1:
+            self.logger.debug(f"Non-IN class {rclass} for {name}")
+        
         if offset + rdlength > len(data):
             raise ValueError("Record data truncated")
         
         rdata = data[offset:offset+rdlength]
+        record_offset = offset
         offset += rdlength
         
-        parsed_data = self.parse_rdata(rtype, rdata, data, offset - rdlength)
+        parsed_data = self.parse_rdata(rtype, rdata, data, record_offset)
         
         if rtype == DNSRecordType.MX and isinstance(parsed_data, tuple):
             exchange, preference = parsed_data
@@ -561,18 +657,29 @@ class DNSResolver:
                         'target': target
                     }
         except Exception as e:
-            pass
+            self.logger.debug(f"Failed to parse rdata type {rtype}: {e}")
         
         return rdata.hex()
     
+    def validate_response_sections(self, data, offset, counts):
+        total_records = sum(counts)
+        if total_records > 100:
+            raise ValueError(f"Too many records in response: {total_records}")
+        
+        min_space = offset + (total_records * 12)
+        if len(data) < min_space:
+            raise ValueError(f"Response truncated: expected at least {min_space} bytes, got {len(data)}")
+    
     def parse_response(self, data, expected_tid, domain, qtype, query_time):
         if len(data) < 12:
-            raise ValueError("Response too short")
+            raise ValueError(f"Response too short: {len(data)} bytes")
         
         tid, flags, qdcount, ancount, nscount, arcount = struct.unpack(">HHHHHH", data[:12])
         
         if tid != expected_tid:
             raise ValueError(f"Transaction ID mismatch: expected {expected_tid}, got {tid}")
+        
+        self.validate_response_sections(data, 12, [qdcount, ancount, nscount, arcount])
         
         rcode = flags & 0x000F
         if rcode != 0:
@@ -616,31 +723,43 @@ class DNSResolver:
         
         for count, section_name in sections:
             for _ in range(count):
+                if offset >= len(data):
+                    self.logger.warning(f"Truncated {section_name} section")
+                    break
                 try:
                     record, offset = self.parse_record(data, offset, section_name)
+                    record.validate()
                     records.append(record)
                 except (ValueError, IndexError) as e:
+                    self.logger.debug(f"Failed to parse {section_name} record: {e}")
                     break
         
         return records
     
     def _update_stats(self, key):
-        if len(self.query_stats) >= self.max_query_stats:
-            self.query_stats.popitem(last=False)
-        self.query_stats[key] = self.query_stats.get(key, 0) + 1
+        with self.stats_lock:
+            if len(self.query_stats) >= self.max_query_stats:
+                oldest_key = next(iter(self.query_stats))
+                del self.query_stats[oldest_key]
+            self.query_stats[key] = self.query_stats.get(key, 0) + 1
     
     def query_server(self, domain, qtype, server, query_time, use_tcp=False):
+        rate_limit_key = f"{server[0]}:{qtype.name}"
+        if not self.rate_limiter.is_allowed(rate_limit_key):
+            raise Exception(f"Rate limit exceeded for {rate_limit_key}")
+        
         query, tid = self.build_query(domain, qtype, edns=True)
         ip, port = server
         
         sock = None
-        family = self.get_address_family(ip)
-        
         try:
+            family = self.get_address_family(ip)
+            
             if use_tcp:
                 sock = socket.socket(family, socket.SOCK_STREAM)
                 sock.settimeout(self.timeout)
                 sock.connect((ip, port))
+                
                 query_len = struct.pack(">H", len(query))
                 sock.sendall(query_len + query)
                 
@@ -650,15 +769,19 @@ class DNSResolver:
                         raise ValueError("Invalid TCP response length")
                     response_len = struct.unpack(">H", length_data)[0]
                     
-                    response = b""
+                    if response_len > 65535:
+                        raise ValueError(f"Response too large: {response_len} bytes")
+                    
+                    response = bytearray()
+                    view = memoryview(response)
                     while len(response) < response_len:
                         chunk = sock.recv(min(4096, response_len - len(response)))
                         if not chunk:
                             break
-                        response += chunk
+                        response.extend(chunk)
                     
                     if len(response) != response_len:
-                        raise ValueError("Incomplete TCP response")
+                        raise ValueError(f"Incomplete TCP response: got {len(response)}/{response_len} bytes")
                 except socket.timeout:
                     self._update_stats(f"tcp_timeout_{ip}")
                     raise TimeoutError(f"TCP timeout after {self.timeout} seconds")
@@ -674,16 +797,18 @@ class DNSResolver:
                         raise ValueError(f"Response from unexpected source: {addr[0]}")
                     
                     if len(data) >= 12 and (data[2] & 0x02):
+                        self.logger.debug("Truncated response, retrying with TCP")
                         return self.query_server(domain, qtype, server, query_time, use_tcp=True)
                     
                     response = data
                 except socket.timeout:
                     if not use_tcp:
+                        self.logger.debug("UDP timeout, retrying with TCP")
                         return self.query_server(domain, qtype, server, query_time, use_tcp=True)
                     self._update_stats(f"udp_timeout_{ip}")
                     raise TimeoutError(f"UDP timeout after {self.timeout} seconds")
             
-            records = self.parse_response(response, tid, domain, qtype, query_time)
+            records = self.parse_response(bytes(response), tid, domain, qtype, query_time)
             self._update_stats(f"success_{ip}")
             return records
             
@@ -714,10 +839,12 @@ class DNSResolver:
                 raise ValueError(f"Unknown query type: {qtype}")
         
         domain = domain.rstrip('.').lower()
+        self.validate_domain(domain)
         query_time = time.time()
         
         if domain in visited:
-            raise RecursionError(f"CNAME loop detected: {' -> '.join(visited)} -> {domain}")
+            chain = ' -> '.join(list(visited) + [domain])
+            raise RecursionError(f"CNAME loop detected: {chain}")
         
         visited.add(domain)
         
@@ -730,6 +857,7 @@ class DNSResolver:
                 if cached:
                     valid_records = [r for r in cached if not r.is_expired]
                     if valid_records:
+                        self.logger.debug(f"Cache hit for {domain} {qtype.name}")
                         return valid_records
             
             servers = [server] if server else self.servers
@@ -738,6 +866,7 @@ class DNSResolver:
             for attempt in range(self.retries):
                 for current_server in servers:
                     try:
+                        self.logger.debug(f"Querying {current_server} for {domain} {qtype.name} (attempt {attempt+1})")
                         records = self.query_server(domain, qtype, current_server, query_time)
                         
                         if not records:
@@ -758,6 +887,7 @@ class DNSResolver:
                             return target_records
                         elif follow_cnames and cname_records:
                             cname_target = cname_records[0].data
+                            self.logger.debug(f"Following CNAME: {domain} -> {cname_target}")
                             return self.resolve(cname_target, qtype, server, follow_cnames, visited)
                         
                         return []
@@ -768,6 +898,7 @@ class DNSResolver:
                         raise
                     except Exception as e:
                         last_error = str(e)
+                        self.logger.debug(f"Query failed: {e}")
                         if attempt < self.retries - 1:
                             time.sleep(min(2 ** attempt, 4))
             
@@ -795,10 +926,11 @@ class DNSResolver:
         return self.resolve(arpa, "PTR")
     
     def get_stats(self):
-        stats = {
-            'query_stats': dict(self.query_stats),
-            'server_count': len(self.servers)
-        }
+        with self.stats_lock:
+            stats = {
+                'query_stats': dict(self.query_stats),
+                'server_count': len(self.servers)
+            }
         if self.use_cache and self.cache:
             stats['cache_stats'] = self.cache.get_stats()
         return stats
@@ -806,7 +938,6 @@ class DNSResolver:
     def clear_cache(self):
         if self.use_cache and self.cache:
             self.cache.clear()
-
 
 def load_config(config_file=None):
     default_config = {
@@ -817,7 +948,10 @@ def load_config(config_file=None):
         'timeout': 3,
         'retries': 2,
         'cache_size': 1000,
-        'cache_ttl': 300
+        'cache_ttl': 300,
+        'dnssec': False,
+        'rate_limit': 10,
+        'rate_window': 1
     }
     
     if config_file and os.path.exists(config_file):
@@ -825,12 +959,11 @@ def load_config(config_file=None):
             with open(config_file, 'r') as f:
                 user_config = json.load(f)
                 default_config.update(user_config)
-        except:
-            pass
+        except Exception as e:
+            logging.error(f"Failed to load config file {config_file}: {e}")
     
     servers = [(s['ip'], s.get('port', 53)) for s in default_config['servers']]
     return default_config, servers
-
 
 def main():
     parser = argparse.ArgumentParser(description="DNS Resolver with TTL Cache")
@@ -845,8 +978,12 @@ def main():
     parser.add_argument("--config", help="Configuration file")
     parser.add_argument("--reverse", "-r", action="store_true", help="Reverse DNS lookup")
     parser.add_argument("--debug", action="store_true", help="Debug mode")
+    parser.add_argument("--dnssec", action="store_true", help="Enable DNSSEC")
     
     args = parser.parse_args()
+    
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
     
     config, default_servers = load_config(args.config)
     
@@ -854,12 +991,16 @@ def main():
         servers=default_servers,
         timeout=config['timeout'],
         retries=config['retries'],
-        use_cache=not args.no_cache
+        use_cache=not args.no_cache,
+        dnssec=args.dnssec or config.get('dnssec', False)
     )
     
     if args.clear_cache:
         resolver.clear_cache()
-        print("Cache cleared" + (" (JSON)" if args.json else ""))
+        if args.json:
+            print(json.dumps({"status": "cache_cleared"}))
+        else:
+            print("Cache cleared")
         return
     
     if args.stats:
@@ -885,7 +1026,7 @@ def main():
         return
     
     if args.list_cache:
-        if resolver.use_cache:
+        if resolver.use_cache and resolver.cache:
             entries = resolver.cache.get_entries()
             if args.json:
                 print(json.dumps(entries, indent=2))
@@ -948,6 +1089,9 @@ def main():
             
     except RecursionError as e:
         print(f"Recursion error: {e}", file=sys.stderr)
+        if args.debug:
+            import traceback
+            traceback.print_exc()
         sys.exit(2)
     except Exception as e:
         if args.debug:
@@ -955,7 +1099,6 @@ def main():
             traceback.print_exc()
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()
