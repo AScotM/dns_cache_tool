@@ -84,6 +84,10 @@ class DNSRecord:
         for label in self.name.rstrip('.').split('.'):
             if len(label) > 63:
                 raise ValueError(f"Label too long: {len(label)} characters")
+            if label and (label.startswith('-') or label.endswith('-')):
+                raise ValueError(f"Label '{label}' cannot start or end with hyphen")
+            if not all(c.isalnum() or c == '-' for c in label):
+                raise ValueError(f"Invalid characters in label '{label}'")
         if self.ttl < 0:
             raise ValueError(f"TTL cannot be negative: {self.ttl}")
     
@@ -178,24 +182,35 @@ class AtomicJSONFile:
         self.lock = threading.RLock()
         self.logger = logging.getLogger(f"{__name__}.AtomicJSONFile")
     
+    def _validate_path(self):
+        filename = str(self.filename)
+        if '..' in filename.split(os.sep):
+            raise ValueError("Invalid file path contains directory traversal")
+    
     def load(self):
         with self.lock:
+            self._validate_path()
+            
             if not self.filename.exists():
                 return {}
             
-            st = os.stat(self.filename)
-            if st.st_mode & 0o777 not in (0o600, 0o700, 0o644):
-                self.logger.warning(f"Insecure file permissions on {self.filename}: {oct(st.st_mode)}")
-            
             try:
+                st = os.stat(self.filename)
+                if st.st_mode & 0o002:
+                    self.logger.warning(f"File is world-writable: {self.filename}")
+                
                 with open(self.filename, 'r') as f:
                     return json.load(f)
             except json.JSONDecodeError as e:
                 self.logger.error(f"JSON decode error in {self.filename}: {e}")
                 return {}
+            except PermissionError as e:
+                self.logger.error(f"Permission denied reading {self.filename}: {e}")
+                return {}
     
     def save(self, data):
         with self.lock:
+            self._validate_path()
             temp_name = None
             try:
                 with tempfile.NamedTemporaryFile(
@@ -227,7 +242,11 @@ class TTLCache:
             filename = "/tmp/dns_ttl_cache.json"
         
         self.filename = pathlib.Path(filename)
-        self.filename.parent.mkdir(mode=0o700, exist_ok=True, parents=True)
+        try:
+            self.filename.parent.mkdir(mode=0o700, exist_ok=True, parents=True)
+        except PermissionError as e:
+            raise PermissionError(f"Cannot create cache directory: {e}")
+        
         self.max_size = max_size
         self.default_ttl = default_ttl
         self.cleanup_interval = cleanup_interval
@@ -283,8 +302,10 @@ class TTLCache:
             self.stats['evictions'] += expired_count
         
         if len(self.data) > self.max_size:
-            sorted_items = sorted(self.data.items(), key=lambda x: x[1].get('expires_at', 0))
-            self.data = dict(sorted_items[-self.max_size:])
+            items_with_expiry = [(k, v.get('expires_at', 0)) for k, v in self.data.items()]
+            items_with_expiry.sort(key=lambda x: x[1])
+            keys_to_keep = [k for k, _ in items_with_expiry[-self.max_size:]]
+            self.data = {k: self.data[k] for k in keys_to_keep}
             self.stats['evictions'] += initial_count - len(self.data)
         
         self.stats['last_cleanup'] = now
@@ -356,11 +377,11 @@ class TTLCache:
             self.data[key] = entry
             
             if len(self.data) > self.max_size:
-                sorted_items = sorted(self.data.items(), 
-                                    key=lambda x: x[1].get('expires_at', 0))
-                evicted_count = len(sorted_items) - self.max_size
-                self.data = dict(sorted_items[-self.max_size:])
-                self.stats['evictions'] += evicted_count
+                items_with_expiry = [(k, v.get('expires_at', 0)) for k, v in self.data.items()]
+                items_with_expiry.sort(key=lambda x: x[1])
+                keys_to_keep = [k for k, _ in items_with_expiry[-self.max_size:]]
+                self.data = {k: self.data[k] for k in keys_to_keep}
+                self.stats['evictions'] += len(items_with_expiry) - self.max_size
             
             self._save()
     
@@ -387,9 +408,10 @@ class TTLCache:
             self.data[key] = entry
             
             if len(self.data) > self.max_size:
-                sorted_items = sorted(self.data.items(), 
-                                    key=lambda x: x[1].get('expires_at', 0))
-                self.data = dict(sorted_items[-self.max_size:])
+                items_with_expiry = [(k, v.get('expires_at', 0)) for k, v in self.data.items()]
+                items_with_expiry.sort(key=lambda x: x[1])
+                keys_to_keep = [k for k, _ in items_with_expiry[-self.max_size:]]
+                self.data = {k: self.data[k] for k in keys_to_keep}
             
             self._save()
     
@@ -405,7 +427,8 @@ class TTLCache:
             self.data = {}
             self.stats = {'hits': 0, 'misses': 0, 'evictions': 0, 'last_cleanup': 0}
             try:
-                self.filename.unlink(missing_ok=True)
+                if self.filename.exists():
+                    self.filename.unlink()
             except Exception as e:
                 self.logger.error(f"Failed to clear cache file: {e}")
     
@@ -443,6 +466,58 @@ class TTLCache:
                 entries.append(entry)
             return entries
 
+class ConnectionPool:
+    def __init__(self, max_connections=10):
+        self.pool = {}
+        self.max_connections = max_connections
+        self.lock = threading.RLock()
+        self.logger = logging.getLogger(f"{__name__}.ConnectionPool")
+    
+    def get_connection(self, server, family):
+        key = (server[0], server[1], family)
+        with self.lock:
+            if key not in self.pool:
+                if len(self.pool) >= self.max_connections:
+                    oldest_key = next(iter(self.pool))
+                    self.close_connection(oldest_key)
+                self.pool[key] = []
+            
+            connections = self.pool[key]
+            if connections:
+                sock = connections.pop()
+                try:
+                    sock.getpeername()
+                    return sock
+                except:
+                    self.logger.debug("Stale connection removed from pool")
+            
+            sock = socket.socket(family, socket.SOCK_STREAM)
+            sock.settimeout(5)
+            return sock
+    
+    def return_connection(self, server, family, sock):
+        key = (server[0], server[1], family)
+        with self.lock:
+            if key in self.pool and len(self.pool[key]) < 5:
+                self.pool[key].append(sock)
+            else:
+                sock.close()
+    
+    def close_connection(self, key):
+        with self.lock:
+            if key in self.pool:
+                for sock in self.pool[key]:
+                    try:
+                        sock.close()
+                    except:
+                        pass
+                del self.pool[key]
+    
+    def close_all(self):
+        with self.lock:
+            for key in list(self.pool.keys()):
+                self.close_connection(key)
+
 class DNSResolver:
     DEFAULT_SERVERS = [
         ("8.8.8.8", 53),
@@ -451,7 +526,9 @@ class DNSResolver:
         ("8.8.4.4", 53)
     ]
     
-    DOMAIN_REGEX = re.compile(r'^(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$')
+    DOMAIN_REGEX = re.compile(
+        r'^(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.[A-Za-z0-9-]{1,63}(?<!-))*\.[A-Za-z]{2,}$'
+    )
     
     def __init__(self, servers=None, timeout=3, retries=2, use_cache=True, cache_file=None, dnssec=False):
         self.servers = servers or self.DEFAULT_SERVERS
@@ -465,17 +542,25 @@ class DNSResolver:
         self.query_stats = {}
         self.max_query_stats = 1000
         self.stats_lock = threading.RLock()
+        self.connection_pool = ConnectionPool()
     
     def validate_domain(self, domain):
         if len(domain) > 253:
             raise ValueError(f"Domain name too long: {len(domain)} characters")
         
-        for label in domain.rstrip('.').split('.'):
+        domain = domain.rstrip('.')
+        if not domain:
+            raise ValueError("Empty domain name")
+        
+        for label in domain.split('.'):
             if len(label) > 63:
                 raise ValueError(f"Label '{label}' exceeds 63 characters")
-            if not label or not self.DOMAIN_REGEX.match(label + '.com'):
-                if not all(c.isalnum() or c == '-' for c in label):
-                    raise ValueError(f"Invalid characters in label '{label}'")
+            if not label:
+                raise ValueError("Empty label in domain name")
+            if label.startswith('-') or label.endswith('-'):
+                raise ValueError(f"Label '{label}' cannot start or end with hyphen")
+            if not all(c.isalnum() or c == '-' for c in label):
+                raise ValueError(f"Invalid characters in label '{label}'")
     
     def get_address_family(self, ip):
         try:
@@ -488,7 +573,7 @@ class DNSResolver:
             except socket.error:
                 raise ValueError(f"Invalid IP address: {ip}")
     
-    def build_query(self, domain, qtype, edns=False):
+    def build_query(self, domain, qtype, edns=False, client_subnet=None):
         self.validate_domain(domain)
         
         tid = secrets.randbelow(65536)
@@ -756,15 +841,19 @@ class DNSResolver:
             family = self.get_address_family(ip)
             
             if use_tcp:
-                sock = socket.socket(family, socket.SOCK_STREAM)
+                sock = self.connection_pool.get_connection(server, family)
                 sock.settimeout(self.timeout)
-                sock.connect((ip, port))
+                
+                try:
+                    sock.connect((ip, port))
+                except socket.timeout:
+                    raise TimeoutError(f"TCP connection timeout after {self.timeout} seconds")
                 
                 query_len = struct.pack(">H", len(query))
                 sock.sendall(query_len + query)
                 
                 try:
-                    length_data = sock.recv(2)
+                    length_data = self._recv_full(sock, 2)
                     if len(length_data) != 2:
                         raise ValueError("Invalid TCP response length")
                     response_len = struct.unpack(">H", length_data)[0]
@@ -772,19 +861,15 @@ class DNSResolver:
                     if response_len > 65535:
                         raise ValueError(f"Response too large: {response_len} bytes")
                     
-                    response = bytearray()
-                    view = memoryview(response)
-                    while len(response) < response_len:
-                        chunk = sock.recv(min(4096, response_len - len(response)))
-                        if not chunk:
-                            break
-                        response.extend(chunk)
-                    
+                    response = self._recv_full(sock, response_len)
                     if len(response) != response_len:
                         raise ValueError(f"Incomplete TCP response: got {len(response)}/{response_len} bytes")
                 except socket.timeout:
                     self._update_stats(f"tcp_timeout_{ip}")
                     raise TimeoutError(f"TCP timeout after {self.timeout} seconds")
+                
+                self.connection_pool.return_connection(server, family, sock)
+                sock = None
             else:
                 sock = socket.socket(family, socket.SOCK_DGRAM)
                 sock.settimeout(self.timeout)
@@ -798,12 +883,14 @@ class DNSResolver:
                     
                     if len(data) >= 12 and (data[2] & 0x02):
                         self.logger.debug("Truncated response, retrying with TCP")
+                        sock.close()
                         return self.query_server(domain, qtype, server, query_time, use_tcp=True)
                     
                     response = data
                 except socket.timeout:
                     if not use_tcp:
                         self.logger.debug("UDP timeout, retrying with TCP")
+                        sock.close()
                         return self.query_server(domain, qtype, server, query_time, use_tcp=True)
                     self._update_stats(f"udp_timeout_{ip}")
                     raise TimeoutError(f"UDP timeout after {self.timeout} seconds")
@@ -828,9 +915,23 @@ class DNSResolver:
             if sock:
                 sock.close()
     
-    def resolve(self, domain, qtype="A", server=None, follow_cnames=True, visited=None):
+    def _recv_full(self, sock, n):
+        data = bytearray()
+        while len(data) < n:
+            chunk = sock.recv(min(4096, n - len(data)))
+            if not chunk:
+                break
+            data.extend(chunk)
+        return bytes(data)
+    
+    def resolve(self, domain, qtype="A", server=None, follow_cnames=True, visited=None, depth=0):
+        MAX_CNAME_DEPTH = 10
         if visited is None:
             visited = set()
+        
+        if depth > MAX_CNAME_DEPTH:
+            chain = ' -> '.join(list(visited) + [domain])
+            raise RecursionError(f"CNAME chain too deep: {chain}")
         
         if isinstance(qtype, str):
             try:
@@ -849,9 +950,6 @@ class DNSResolver:
         visited.add(domain)
         
         try:
-            if len(visited) > 10:
-                raise RecursionError(f"CNAME chain too deep for {domain}")
-            
             if self.use_cache and self.cache:
                 cached = self.cache.get(domain, qtype, str(server or "default"))
                 if cached:
@@ -888,7 +986,7 @@ class DNSResolver:
                         elif follow_cnames and cname_records:
                             cname_target = cname_records[0].data
                             self.logger.debug(f"Following CNAME: {domain} -> {cname_target}")
-                            return self.resolve(cname_target, qtype, server, follow_cnames, visited)
+                            return self.resolve(cname_target, qtype, server, follow_cnames, visited, depth + 1)
                         
                         return []
                         
@@ -938,6 +1036,9 @@ class DNSResolver:
     def clear_cache(self):
         if self.use_cache and self.cache:
             self.cache.clear()
+    
+    def close(self):
+        self.connection_pool.close_all()
 
 def load_config(config_file=None):
     default_config = {
@@ -956,7 +1057,11 @@ def load_config(config_file=None):
     
     if config_file and os.path.exists(config_file):
         try:
-            with open(config_file, 'r') as f:
+            config_path = os.path.abspath(config_file)
+            if '..' in config_path.split(os.sep):
+                raise ValueError("Invalid config file path")
+                
+            with open(config_path, 'r') as f:
                 user_config = json.load(f)
                 default_config.update(user_config)
         except Exception as e:
@@ -987,118 +1092,123 @@ def main():
     
     config, default_servers = load_config(args.config)
     
-    resolver = DNSResolver(
-        servers=default_servers,
-        timeout=config['timeout'],
-        retries=config['retries'],
-        use_cache=not args.no_cache,
-        dnssec=args.dnssec or config.get('dnssec', False)
-    )
-    
-    if args.clear_cache:
-        resolver.clear_cache()
-        if args.json:
-            print(json.dumps({"status": "cache_cleared"}))
-        else:
-            print("Cache cleared")
-        return
-    
-    if args.stats:
-        stats = resolver.get_stats()
-        if args.json:
-            print(json.dumps(stats, indent=2))
-        else:
-            print("Resolver Statistics:")
-            print(f"  Servers configured: {stats['server_count']}")
-            for key, value in sorted(stats['query_stats'].items()):
-                print(f"  {key}: {value}")
-            if 'cache_stats' in stats:
-                cache_stats = stats['cache_stats']
-                print("\nCache Statistics:")
-                print(f"  Total entries: {cache_stats['total_entries']}")
-                print(f"  Positive entries: {cache_stats['positive_entries']}")
-                print(f"  Negative entries: {cache_stats['negative_entries']}")
-                print(f"  Cache hits: {cache_stats['cache_hits']}")
-                print(f"  Cache misses: {cache_stats['cache_misses']}")
-                print(f"  Evictions: {cache_stats['evictions']}")
-                print(f"  Hit rate: {cache_stats['hit_rate']:.1%}")
-                print(f"  Avg entry age: {cache_stats['avg_entry_age']:.1f}s")
-        return
-    
-    if args.list_cache:
-        if resolver.use_cache and resolver.cache:
-            entries = resolver.cache.get_entries()
-            if args.json:
-                print(json.dumps(entries, indent=2))
-            else:
-                for entry in entries:
-                    status = "NEGATIVE" if entry.get('negative') else "POSITIVE"
-                    print(f"{entry['domain']:40} {entry['type']:6} {status:8} "
-                          f"TTL={entry['ttl']:4} Remaining={entry['remaining_ttl']:4}s")
-        return
-    
-    if not args.query:
-        parser.print_help()
-        return
-    
+    resolver = None
     try:
-        server = None
-        if args.server:
-            parts = args.server.split(":")
-            ip = parts[0]
-            port = int(parts[1]) if len(parts) > 1 else 53
-            server = (ip, port)
+        resolver = DNSResolver(
+            servers=default_servers,
+            timeout=config['timeout'],
+            retries=config['retries'],
+            use_cache=not args.no_cache,
+            dnssec=args.dnssec or config.get('dnssec', False)
+        )
         
-        if args.reverse:
-            records = resolver.reverse_lookup(args.query)
-            qtype = "PTR"
-        else:
-            records = resolver.resolve(args.query, args.type, server)
-            qtype = args.type
-        
-        if args.json:
-            result = {
-                'query': args.query,
-                'type': qtype,
-                'reverse': args.reverse,
-                'timestamp': time.time(),
-                'records': [r.to_cache_dict() for r in records]
-            }
-            print(json.dumps(result, indent=2))
-        else:
-            if args.reverse:
-                print(f"\nReverse DNS lookup for {args.query}:")
+        if args.clear_cache:
+            resolver.clear_cache()
+            if args.json:
+                print(json.dumps({"status": "cache_cleared"}))
             else:
-                print(f"\nDNS {qtype} records for {args.query}:")
+                print("Cache cleared")
+            return
+        
+        if args.stats:
+            stats = resolver.get_stats()
+            if args.json:
+                print(json.dumps(stats, indent=2))
+            else:
+                print("Resolver Statistics:")
+                print(f"  Servers configured: {stats['server_count']}")
+                for key, value in sorted(stats['query_stats'].items()):
+                    print(f"  {key}: {value}")
+                if 'cache_stats' in stats:
+                    cache_stats = stats['cache_stats']
+                    print("\nCache Statistics:")
+                    print(f"  Total entries: {cache_stats['total_entries']}")
+                    print(f"  Positive entries: {cache_stats['positive_entries']}")
+                    print(f"  Negative entries: {cache_stats['negative_entries']}")
+                    print(f"  Cache hits: {cache_stats['cache_hits']}")
+                    print(f"  Cache misses: {cache_stats['cache_misses']}")
+                    print(f"  Evictions: {cache_stats['evictions']}")
+                    print(f"  Hit rate: {cache_stats['hit_rate']:.1%}")
+                    print(f"  Avg entry age: {cache_stats['avg_entry_age']:.1f}s")
+            return
+        
+        if args.list_cache:
+            if resolver.use_cache and resolver.cache:
+                entries = resolver.cache.get_entries()
+                if args.json:
+                    print(json.dumps(entries, indent=2))
+                else:
+                    for entry in entries:
+                        status = "NEGATIVE" if entry.get('negative') else "POSITIVE"
+                        print(f"{entry['domain']:40} {entry['type']:6} {status:8} "
+                              f"TTL={entry['ttl']:4} Remaining={entry['remaining_ttl']:4}s")
+            return
+        
+        if not args.query:
+            parser.print_help()
+            return
+        
+        try:
+            server = None
+            if args.server:
+                parts = args.server.split(":")
+                ip = parts[0]
+                port = int(parts[1]) if len(parts) > 1 else 53
+                server = (ip, port)
             
-            if not records:
-                print("No records found")
-                return
+            if args.reverse:
+                records = resolver.reverse_lookup(args.query)
+                qtype = "PTR"
+            else:
+                records = resolver.resolve(args.query, args.type, server)
+                qtype = args.type
             
-            sections = {}
-            for r in records:
-                sections.setdefault(r.section, []).append(r)
-            
-            for sec in ['answer', 'authority', 'additional']:
-                if sec in sections and sections[sec]:
-                    print(f"\n;; {sec.capitalize()} Section:")
-                    for rec in sections[sec]:
-                        ttl_str = f"{rec.remaining_ttl}/{rec.ttl}" if rec.ttl > 0 else str(rec.ttl)
-                        print(f"{rec.name:40} {ttl_str:>8} IN {rec}")
-            print()
-            
-    except RecursionError as e:
-        print(f"Recursion error: {e}", file=sys.stderr)
-        if args.debug:
-            import traceback
-            traceback.print_exc()
-        sys.exit(2)
-    except Exception as e:
-        if args.debug:
-            import traceback
-            traceback.print_exc()
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
+            if args.json:
+                result = {
+                    'query': args.query,
+                    'type': qtype,
+                    'reverse': args.reverse,
+                    'timestamp': time.time(),
+                    'records': [r.to_cache_dict() for r in records]
+                }
+                print(json.dumps(result, indent=2))
+            else:
+                if args.reverse:
+                    print(f"\nReverse DNS lookup for {args.query}:")
+                else:
+                    print(f"\nDNS {qtype} records for {args.query}:")
+                
+                if not records:
+                    print("No records found")
+                    return
+                
+                sections = {}
+                for r in records:
+                    sections.setdefault(r.section, []).append(r)
+                
+                for sec in ['answer', 'authority', 'additional']:
+                    if sec in sections and sections[sec]:
+                        print(f"\n;; {sec.capitalize()} Section:")
+                        for rec in sections[sec]:
+                            ttl_str = f"{rec.remaining_ttl}/{rec.ttl}" if rec.ttl > 0 else str(rec.ttl)
+                            print(f"{rec.name:40} {ttl_str:>8} IN {rec}")
+                print()
+                
+        except RecursionError as e:
+            print(f"Recursion error: {e}", file=sys.stderr)
+            if args.debug:
+                import traceback
+                traceback.print_exc()
+            sys.exit(2)
+        except Exception as e:
+            if args.debug:
+                import traceback
+                traceback.print_exc()
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+    finally:
+        if resolver:
+            resolver.close()
 
 if __name__ == "__main__":
     main()
